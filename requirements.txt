@@ -1,0 +1,11 @@
+chex
+equinox
+flax
+jax[cuda12_pip]==0.4.28
+jaxlib==0.4.28+cuda12.cudnn89
+matplotlib
+numpy
+optax
+pgx
+scipy
+
