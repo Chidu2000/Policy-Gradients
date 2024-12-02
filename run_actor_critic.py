@@ -8,7 +8,7 @@ from trainers import ActorCriticTrainer
 
 SEED = 42
 NUM_EPISODES = 1_500
-BATCH_SIZE = 200  # Modify the batch size here
+BATCH_SIZE = 4  # Modify the batch size here
 SAVE_ROOT = Path("results")
 SAVE_ROOT.mkdir(parents=True, exist_ok=True)
 

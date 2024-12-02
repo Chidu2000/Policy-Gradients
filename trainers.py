@@ -160,7 +160,6 @@ class ReinforceTrainer(BaseTrainer[Union[ReinforcePolicyState, ActorCriticState]
                     carry.trainer_state.current_env_state.observation,
                     carry.trainer_state.current_env_state.legal_action_mask
                 )
-                print("action", action)
                 next_env_state = self.env.step(carry.trainer_state.current_env_state, action, step_key)
                 done = next_env_state.terminated | next_env_state.truncated
                 reward = next_env_state.rewards[0]
