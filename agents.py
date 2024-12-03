@@ -484,41 +484,34 @@ class ReinforceBaselinePolicy(ActorCriticPolicy, ReinforcePolicy):
         """
         actor_parameters, critic_parameters = model_parameters
 
-        def forward_actor(params, states):
-            return self.actor.get_logits(params, states)
+        observations, actions, action_mask = (transitions.observation, transitions.action, transitions.action_mask)
 
-        def forward_critic(params, states):
-            return self.critic.get_logits(params, states)
+        G = self.compute_discounted_returns(transitions, discount_factor=self.discount_factor)
 
-        # Unpack transitions
-        states = transitions.observation
-        rewards = transitions.reward
-        next_states = transitions.next_observation
-        done = transitions.done
+        critic_logits = self.critic.get_batch_logits(critic_parameters, observations)
 
-        # Forward pass
-        log_probs = jax.vmap(forward_actor, in_axes=(None, 0))(actor_parameters, states)  # [batch_size, action_dim]
-        log_probs = log_probs[jnp.arange(log_probs.shape[0]), transitions.action]
-        values = jax.vmap(forward_critic, in_axes=(None, 0))(critic_parameters, states)  # [batch_size]
-        next_values = jax.vmap(forward_critic, in_axes=(None, 0))(critic_parameters, next_states)  # [batch_size]
+        #Compute advantage
+        advantage = G - jax.lax.stop_gradient(critic_logits)
 
+        def compute_log_prob(carry, idx):
+            action_probabilities = self.get_action_probabilities(
+                actor_parameters, observations[idx], action_mask[idx]
+            )
+            log_probabilities = jnp.log(action_probabilities[actions[idx]])
+            return carry, log_probabilities
 
-        # Compute G_t (return)
-        G_t = rewards + (1 - done) * self.discount_factor * next_values
-
-        # Compute the advantage
-        advantage = jax.lax.stop_gradient(G_t - values)
-
-        # Actor loss
-        actor_loss = -jnp.sum(log_probs * advantage)
-
-        # Critic loss
-        critic_loss = 0.5 * jnp.sum(jnp.square(G_t - values))
+        _, action_log_probabilities = jax.lax.scan(
+            compute_log_prob,
+            None,  # carry is not needed
+            jnp.arange(observations.shape[0]),
+        )
+        
+        actor_loss =  -jnp.mean(action_log_probabilities*advantage)
+        critic_loss = jnp.mean(advantage**2)   #(G - Vpi)^2
 
         # Total loss
         loss = actor_loss + critic_loss
 
-        # Logging
         loss_dict = {
             "Actor loss": actor_loss,
             "Value network loss": critic_loss,
