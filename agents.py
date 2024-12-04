@@ -256,22 +256,31 @@ class ReinforcePolicy(Policy[ReinforcePolicyState]):
         :param float discount_factor: Discount factor to use
         """
         ### ------------------------- To implement -------------------------
-        rewards = transitions.reward
-        dones = transitions.done
 
-        # Initialize discounted returns
-        discounted_returns = jnp.zeros_like(rewards)
-        running_return = 0.0
+        rewards = transitions.reward  
+        rewards = jnp.clip(rewards, -20.0, 20.0) #Clip rewards
+        dones = transitions.done      
+        time_steps = dones.shape[0]
+        
+        returns = jnp.zeros_like(rewards)
+                
+        # Reverse time order: we will use `jax.lax.scan`
+        def step(carry, t):
+            returns_next = carry  # Discounted return from the next time step
+            reward_t = rewards[t]
+            done_t = dones[t]
 
-        # Calculate discounted returns in reverse order
-        for i in range(rewards.shape[0] - 1, -1, -1):
-            running_return = rewards[i] + discount_factor * running_return * (1.0 - dones[i])
-            discounted_returns = discounted_returns.at[i].set(running_return)
+            # Compute discounted return for time step t
+            returns_t = reward_t + discount_factor * returns_next * (1.0 - done_t)
+            return returns_t, returns_t
 
-        return discounted_returns
-
-
-        ### ----------------------------------------------------------------
+        returns, _ = jax.lax.scan(
+            step,
+            returns,               # Initial carry (final returns start as 0)
+            jnp.arange(time_steps - 1, -1, -1)   # Time steps in reverse order)
+        )
+                                              
+        return returns[::-1]
 
     def get_action_probabilities(self, model_parameters: eqx.Module, observation: jax.Array, action_mask: jax.Array) -> jax.Array:
         """
@@ -285,19 +294,14 @@ class ReinforcePolicy(Policy[ReinforcePolicyState]):
             Forbidden actions must have a probability of 0.
         """
         ### ------------------------- To implement -------------------------
-        # Forward pass through the actor network
-        if observation.ndim == 4:  # Batched case
-            observation = observation[0]
 
-        logits = self.actor.get_logits(model_parameters, observation)  # Shape [4], raw logits for each action
+        logits = self.actor.get_logits(model_parameters, observation)
 
-        masked_logits = jnp.where(action_mask, logits, -jnp.inf)  # Invalid actions get -inf
+        exp_h = jnp.exp(logits) 
+        action_probabilities = exp_h / exp_h.sum(axis=0)
 
-        # Compute softmax probabilities
-        action_probabilities = jax.nn.softmax(masked_logits)  # Shape [4]
-
-        # Ensure forbidden actions have probability 0
-        action_probabilities = jnp.where(action_mask, action_probabilities, 0)
+        action_probabilities = action_probabilities * action_mask
+        action_probabilities = action_probabilities/action_probabilities.sum(axis=0)
 
         return action_probabilities
 
@@ -314,19 +318,24 @@ class ReinforcePolicy(Policy[ReinforcePolicyState]):
         :return log_dict (dict[str, float]): Dictionnary containing entries to log
         """
         ### ------------------------- To implement -------------------------
-        discounted_returns = self.compute_discounted_returns(
-            transitions=transitions, 
-            discount_factor=self.discount_factor
+        observations, actions, action_mask = (transitions.observation,transitions.action,transitions.action_mask)
+
+        discounted_returns = self.compute_discounted_returns(transitions, self.discount_factor)
+
+        def calc_log_prob(carry, idx):
+            action_probabilities = self.get_action_probabilities(
+                model_parameters, observations[idx], action_mask[idx]
+            )
+            log_probabilities = jnp.log(action_probabilities[actions[idx]])
+            return carry, log_probabilities
+
+        _, action_log_probabilities = jax.lax.scan(
+            calc_log_prob,
+            None,  # carry is not needed
+            jnp.arange(observations.shape[0]),
         )
 
-        # Step 2: Compute action probabilities
-        action_probs = self.get_action_probabilities(model_parameters, transitions.observation, transitions.action_mask)
-        action_log_probs = jnp.log(action_probs)  # Shape [batch_size]
-        action_log_probs = action_log_probs[jnp.arange(action_log_probs.shape[0]), transitions.action]
-
-        # Step 4: Compute loss as the negative sum of G_k * log(pi(a_k | s_k))
-        loss = -jnp.mean(discounted_returns * action_log_probs)
-
+        loss = -jnp.mean(discounted_returns*action_log_probabilities)
         ### ----------------------------------------------------------------
         return loss, {"Actor loss": loss}
 
@@ -381,13 +390,11 @@ class BaseActorCriticPolicy(Policy[TActorCriticState], Generic[TActorCriticState
         ### ------------------------- To implement -------------------------
         logits = self.actor.get_logits(model_parameters,observation)  # Shape [4], raw logits for each action
 
-        masked_logits = jnp.where(action_mask, logits, -jnp.inf)  # Invalid actions get -inf
+        exp_h = jnp.exp(logits) 
+        action_probabilities = exp_h / exp_h.sum(axis=0)
 
-        # Compute softmax probabilities
-        action_probabilities = jax.nn.softmax(masked_logits)  # Shape [4]
-
-        # Ensure forbidden actions have probability 0
-        action_probabilities = jnp.where(action_mask, action_probabilities, 0)
+        action_probabilities = action_probabilities * action_mask
+        action_probabilities = action_probabilities/action_probabilities.sum(axis=0)
 
         return action_probabilities
 
@@ -412,39 +419,34 @@ class ActorCriticPolicy(BaseActorCriticPolicy[ActorCriticState]):
         """
         actor_parameters, critic_parameters = model_parameters
         ### ------------------------- To implement -------------------------
-        observations, actions, action_mask, rewards, dones, next_observation = (transitions.observation, 
-                                                       transitions.action, 
-                                                       transitions.action_mask,
-                                                       transitions.reward,
-                                                       transitions.done,
-                                                       transitions.next_observation
-                                                       )
+        observations, actions, action_mask, rewards, dones, next_observation = (transitions.observation, transitions.action, transitions.action_mask, transitions.reward,
+                                                       transitions.done, transitions.next_observation)
 
-        predicted_values = self.critic.get_batch_logits(critic_parameters, observations)  # V(s)
-        next_values = self.critic.get_batch_logits(critic_parameters, next_observation)  # V(s')
+        predicted_values = self.critic.get_batch_logits(critic_parameters, observations)  
+        next_values = self.critic.get_batch_logits(critic_parameters, next_observation)  
 
-        # Compute target values: r + γ * V(s') * (1 - done)
-        actor_advantage = rewards + self.discount_factor*jax.lax.stop_gradient(next_values*(1.0 - dones)) - jax.lax.stop_gradient(predicted_values)
-        critic_advantage = predicted_values - jax.lax.stop_gradient(rewards + self.discount_factor*next_values*(1.0 - dones))
+        rewards = jnp.clip(rewards, -20, 20)
 
-        #Get log pi(a|s, theta)
-        def compute_log_prob(carry, idx):
+        td_error = rewards + self.discount_factor*next_values*(1.0 - dones) - predicted_values
+
+        td_objective = predicted_values - jax.lax.stop_gradient(rewards + self.discount_factor*next_values*(1.0 - dones))
+
+        def compute_log_probability(carry, idx):
             action_probabilities = self.get_action_probabilities(
                 actor_parameters, observations[idx], action_mask[idx]
             )
             log_probabilities = jnp.log(action_probabilities[actions[idx]])
             return carry, log_probabilities
 
-        # Use lax.scan to compute all action log probabilities
         _, action_log_probabilities = jax.lax.scan(
-            compute_log_prob,
+            compute_log_probability,
             None,  # carry is not needed
             jnp.arange(observations.shape[0]),
         )
         
         #Compute losses
-        actor_loss =  -jnp.mean(action_log_probabilities*(actor_advantage))
-        critic_loss = 0.5*jnp.mean(critic_advantage**2) 
+        actor_loss =  -jnp.mean(action_log_probabilities*jax.lax.stop_gradient(td_error))
+        critic_loss = 0.5*jnp.mean(td_objective**2) 
         loss = actor_loss + critic_loss
         ### ----------------------------------------------------------------
 
@@ -486,12 +488,11 @@ class ReinforceBaselinePolicy(ActorCriticPolicy, ReinforcePolicy):
 
         observations, actions, action_mask = (transitions.observation, transitions.action, transitions.action_mask)
 
-        G = self.compute_discounted_returns(transitions, discount_factor=self.discount_factor)
+        returns = self.compute_discounted_returns(transitions, discount_factor=self.discount_factor)
 
-        critic_logits = self.critic.get_batch_logits(critic_parameters, observations)
+        crt_logits = self.critic.get_batch_logits(critic_parameters, observations)
 
-        #Compute advantage
-        advantage = G - jax.lax.stop_gradient(critic_logits)
+        advantage = returns - jax.lax.stop_gradient(crt_logits)
 
         def compute_log_prob(carry, idx):
             action_probabilities = self.get_action_probabilities(
@@ -507,13 +508,12 @@ class ReinforceBaselinePolicy(ActorCriticPolicy, ReinforcePolicy):
         )
         
         actor_loss =  -jnp.mean(action_log_probabilities*advantage)
-        critic_loss = jnp.mean(advantage**2)   #(G - Vpi)^2
-
-        # Total loss
+        critic_loss = jnp.mean(advantage**2)   
         loss = actor_loss + critic_loss
+        ### ----------------------------------------------------------------
 
         loss_dict = {
             "Actor loss": actor_loss,
-            "Value network loss": critic_loss,
+            "Value network loss": critic_loss
         }
         return loss, loss_dict
